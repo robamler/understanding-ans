@@ -19,8 +19,8 @@ use constriction::{
     backends::{BoundedReadWords, WriteWords},
     stream::{
         model::{
-            DecoderModel, EncoderModel, LookupDecoderModel, NonContiguousCategoricalDecoderModel,
-            NonContiguousCategoricalEncoderModel, NonContiguousSymbolTable,
+            ContiguousCategoricalEntropyModel, DecoderModel, EncoderModel, EntropyModel,
+            LookupDecoderModel, NonContiguousSymbolTable,
         },
         queue::RangeEncoder,
         stack::AnsCoder,
@@ -121,27 +121,18 @@ where
     }
 }
 
-fn cross_entropy<M, const PRECISION: usize>(
-    symbols: &[i16],
-    counts: &[f64],
-    total_count: usize,
-    model: M,
-) -> f64
+fn cross_entropy<M, const PRECISION: usize>(counts: &[f64], total_count: usize, model: M) -> f64
 where
-    M: EncoderModel<PRECISION, Symbol = i16>,
+    M: EncoderModel<PRECISION, Symbol = usize>,
     M::Probability: AsPrimitive<f64>,
 {
     PRECISION as f64
-        - symbols
+        - counts
             .iter()
-            .zip(counts)
-            .map(|(&symbol, &count)| {
-                let probability = model
-                    .left_cumulative_and_probability(symbol)
-                    .unwrap()
-                    .1
-                    .get();
-                count as f64 * probability.as_().log2()
+            .enumerate()
+            .map(|(id, &count)| {
+                let probability = model.left_cumulative_and_probability(id).unwrap().1.get();
+                count * probability.as_().log2()
             })
             .sum::<f64>()
             / total_count as f64
@@ -158,9 +149,58 @@ trait DecoderModelBuilder<Encoder, const PRECISION: usize>
 where
     Encoder: Code,
 {
-    type DecoderModel: DecoderModel<PRECISION, Probability = Encoder::Word, Symbol = i16>;
+    type DecoderModel<'s>: DecoderModel<PRECISION, Probability = Encoder::Word, Symbol = i16>;
 
-    fn build(symbols: &[i16], counts: &[f64]) -> Self::DecoderModel;
+    fn build<'s>(symbols: &'s [i16], counts: &[f64]) -> Self::DecoderModel<'s>;
+}
+
+#[derive(Clone, Debug)]
+struct NonLookupDecoderModel<'s, Probability, const PRECISION: usize> {
+    model: ContiguousCategoricalEntropyModel<Probability, Vec<Probability>, PRECISION>,
+    symbols: &'s [i16],
+}
+
+impl<'s, Probability, const PRECISION: usize> NonLookupDecoderModel<'s, Probability, PRECISION>
+where
+    Probability: BitArray + AsPrimitive<usize>,
+    f64: AsPrimitive<Probability> + From<Probability>,
+    usize: AsPrimitive<Probability>,
+{
+    fn from_symbols_and_floating_point_probabilities(
+        symbols: &'s [i16],
+        probabilities: &[f64],
+    ) -> Self {
+        let model =
+            ContiguousCategoricalEntropyModel::from_floating_point_probabilities(probabilities)
+                .unwrap();
+
+        Self { model, symbols }
+    }
+}
+
+impl<'s, Probability: BitArray, const PRECISION: usize> EntropyModel<PRECISION>
+    for NonLookupDecoderModel<'s, Probability, PRECISION>
+{
+    type Symbol = i16;
+    type Probability = Probability;
+}
+
+impl<'s, Probability: BitArray, const PRECISION: usize> DecoderModel<PRECISION>
+    for NonLookupDecoderModel<'s, Probability, PRECISION>
+{
+    #[inline(always)]
+    fn quantile_function(
+        &self,
+        quantile: Self::Probability,
+    ) -> (
+        Self::Symbol,
+        Self::Probability,
+        <Self::Probability as BitArray>::NonZero,
+    ) {
+        let (symbol_id, left_cumulant, probability) = self.model.quantile_function(quantile);
+        let symbol = self.symbols[symbol_id];
+        (symbol, left_cumulant, probability)
+    }
 }
 
 struct NonLookup<Encoder, const PRECISION: usize>(PhantomData<Encoder>);
@@ -177,19 +217,14 @@ where
         + AsPrimitive<f64>
         + std::convert::Into<f64>
         + AsPrimitive<<Encoder as Code>::Word>,
-    f64: AsPrimitive<<Encoder as Code>::Word>,
+    f64: AsPrimitive<<Encoder as Code>::Word> + From<<Encoder as Code>::Word>,
     usize: AsPrimitive<<Encoder as Code>::Word>,
 {
     #[allow(clippy::type_complexity)]
-    type DecoderModel = NonContiguousCategoricalDecoderModel<
-        i16,
-        <Encoder as Code>::Word,
-        Vec<(<Encoder as Code>::Word, i16)>,
-        PRECISION,
-    >;
+    type DecoderModel<'s> = NonLookupDecoderModel<'s, <Encoder as Code>::Word, PRECISION>;
 
-    fn build(symbols: &[i16], counts: &[f64]) -> Self::DecoderModel {
-        Self::DecoderModel::from_symbols_and_floating_point_probabilities(symbols, counts).unwrap()
+    fn build<'s>(symbols: &'s [i16], counts: &[f64]) -> Self::DecoderModel<'s> {
+        Self::DecoderModel::from_symbols_and_floating_point_probabilities(symbols, counts)
     }
 }
 
@@ -212,7 +247,7 @@ where
     <Encoder as Code>::Word: Into<usize>,
 {
     #[allow(clippy::type_complexity)]
-    type DecoderModel = LookupDecoderModel<
+    type DecoderModel<'s> = LookupDecoderModel<
         i16,
         <Encoder as Code>::Word,
         NonContiguousSymbolTable<Vec<(<Encoder as Code>::Word, i16)>>,
@@ -220,7 +255,7 @@ where
         PRECISION,
     >;
 
-    fn build(symbols: &[i16], counts: &[f64]) -> Self::DecoderModel {
+    fn build<'s>(symbols: &'s [i16], counts: &[f64]) -> Self::DecoderModel<'s> {
         Self::DecoderModel::from_symbols_and_floating_point_probabilities(symbols, counts).unwrap()
     }
 }
@@ -282,30 +317,35 @@ fn run_constriction<Encoder, Builder, const PRECISION: usize>(
         let data = &data[t][..];
         let stats = &stats[t];
 
-        let encoder_model = NonContiguousCategoricalEncoderModel::<
-            i16,
+        let id_to_symbols = &stats.symbols[..];
+        let symbols_to_ids = id_to_symbols
+            .iter()
+            .enumerate()
+            .map(|(id, &symbol)| (symbol, id))
+            .collect::<HashMap<_, _>>();
+
+        let encoder_model = ContiguousCategoricalEntropyModel::<
             <Encoder as Code>::Word,
+            _,
             PRECISION,
-        >::from_symbols_and_floating_point_probabilities(
-            stats.symbols.iter().cloned(),
-            &stats.counts_f64,
-        )
+        >::from_floating_point_probabilities(&stats.counts_f64)
         .unwrap();
 
         let decoder_model = Builder::build(&stats.symbols, &stats.counts_f64);
 
-        let cross_entropy = cross_entropy(
-            &stats.symbols,
-            &stats.counts_f64,
-            data.len(),
-            &encoder_model,
-        );
+        let cross_entropy = cross_entropy(&stats.counts_f64, data.len(), &encoder_model);
 
         let mut i = 0;
         let (bitrate, duration_encode, encoder) = loop {
             let mut encoder = Encoder::default();
             let start_time = Instant::now();
-            encoder.encode_iid_symbols(data, &encoder_model).unwrap();
+            encoder
+                .encode_iid_symbols(
+                    data.iter()
+                        .map(|symbol| symbols_to_ids.get(symbol).unwrap()),
+                    &encoder_model,
+                )
+                .unwrap();
             let end_time = Instant::now();
             let duration_encode = (end_time - start_time).as_nanos();
             let bitrate = encoder.bitrate();
